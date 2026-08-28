@@ -1,0 +1,865 @@
+import threading
+import time
+from pathlib import Path
+from queue import Empty, Full, Queue
+
+import cv2
+import face_recognition
+
+from central.ocorrencias import reconhecer_e_registrar_ocorrencia
+
+# ============================================================
+
+# CONFIGURAÇÕES
+
+# ============================================================
+
+CAMERA_ID = 1
+CAMERA_INDEX = 0
+
+ESCALA_DETECCAO = 0.5
+
+INTERVALO_DETECCAO = 0.35
+
+UPSAMPLE = 0
+
+INTERVALO_OCORRENCIA = 5.0
+
+CAPTURES_DIR = Path("captures")
+
+# ============================================================
+
+# ESTADO COMPARTILHADO
+
+# ============================================================
+
+frame_para_processar = None
+
+localizacoes_rosto = []
+
+resultado_reconhecimento = {
+"boxes": [],
+"matched_boxes": [],
+}
+
+lock_frame = threading.Lock()
+lock_resultado = threading.Lock()
+lock_ocorrencia = threading.Lock()
+
+executando = True
+
+fila_reconhecimento = Queue(maxsize=1)
+
+ultimo_registro = 0.0
+
+# ============================================================
+
+# CÂMERA
+
+# ============================================================
+
+def abrir_camera(camera_index=CAMERA_INDEX):
+"""
+Abre a câmera física.
+"""
+
+```
+camera = cv2.VideoCapture(camera_index)
+
+if not camera.isOpened():
+    raise RuntimeError(
+        f"Não foi possível abrir a câmera {camera_index}."
+    )
+
+try:
+    camera.set(
+        cv2.CAP_PROP_BUFFERSIZE,
+        1,
+    )
+except Exception:
+    pass
+
+return camera
+```
+
+# ============================================================
+
+# DETECÇÃO FACIAL
+
+# ============================================================
+
+def detectar_rostos(frame):
+"""
+Detecta rostos utilizando o modelo HOG.
+
+```
+O frame é reduzido para acelerar a detecção.
+As coordenadas são convertidas novamente para
+o tamanho original.
+"""
+
+if frame is None:
+    return []
+
+altura, largura = frame.shape[:2]
+
+largura_reduzida = int(
+    largura * ESCALA_DETECCAO
+)
+
+altura_reduzida = int(
+    altura * ESCALA_DETECCAO
+)
+
+if largura_reduzida <= 0:
+    return []
+
+if altura_reduzida <= 0:
+    return []
+
+frame_reduzido = cv2.resize(
+    frame,
+    (
+        largura_reduzida,
+        altura_reduzida,
+    ),
+    interpolation=cv2.INTER_AREA,
+)
+
+frame_rgb = cv2.cvtColor(
+    frame_reduzido,
+    cv2.COLOR_BGR2RGB,
+)
+
+locais = face_recognition.face_locations(
+    frame_rgb,
+    number_of_times_to_upsample=UPSAMPLE,
+    model="hog",
+)
+
+if not locais:
+    return []
+
+fator = 1.0 / ESCALA_DETECCAO
+
+locais_originais = []
+
+for top, right, bottom, left in locais:
+
+    top = int(top * fator)
+    right = int(right * fator)
+    bottom = int(bottom * fator)
+    left = int(left * fator)
+
+    top = max(
+        0,
+        min(top, altura - 1),
+    )
+
+    bottom = max(
+        0,
+        min(bottom, altura - 1),
+    )
+
+    left = max(
+        0,
+        min(left, largura - 1),
+    )
+
+    right = max(
+        0,
+        min(right, largura - 1),
+    )
+
+    locais_originais.append(
+        (
+            top,
+            right,
+            bottom,
+            left,
+        )
+    )
+
+return locais_originais
+```
+
+# ============================================================
+
+# SALVAR FRAME
+
+# ============================================================
+
+def salvar_frame(frame):
+"""
+Salva um frame em captures/.
+"""
+
+```
+CAPTURES_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+timestamp = time.strftime(
+    "%Y%m%d_%H%M%S"
+)
+
+caminho = (
+    CAPTURES_DIR
+    / (
+        f"captura_{timestamp}_"
+        f"{time.time_ns()}.jpg"
+    )
+)
+
+sucesso = cv2.imwrite(
+    str(caminho),
+    frame,
+)
+
+if not sucesso:
+    raise RuntimeError(
+        f"Não foi possível salvar o frame: {caminho}"
+    )
+
+return caminho.resolve()
+```
+
+# ============================================================
+
+# AGENDAMENTO DO RECONHECIMENTO
+
+# ============================================================
+
+def tentar_agendar_reconhecimento(
+frame,
+locais,
+):
+"""
+Envia o frame para a thread de reconhecimento.
+
+```
+O reconhecimento não é executado aqui.
+"""
+
+global ultimo_registro
+
+if frame is None:
+    return
+
+if not locais:
+    return
+
+agora = time.time()
+
+with lock_ocorrencia:
+
+    if (
+        agora - ultimo_registro
+        < INTERVALO_OCORRENCIA
+    ):
+        return
+
+    ultimo_registro = agora
+
+item = {
+    "frame": frame.copy(),
+    "localizacoes": list(locais),
+}
+
+try:
+
+    fila_reconhecimento.put_nowait(
+        item
+    )
+
+    print(
+        "[RECONHECIMENTO] "
+        "Frame enviado para processamento."
+    )
+
+except Full:
+
+    print(
+        "[RECONHECIMENTO] "
+        "Processamento ocupado; "
+        "frame descartado."
+    )
+```
+
+# ============================================================
+
+# THREAD DE RECONHECIMENTO
+
+# ============================================================
+
+def trabalhador_reconhecimento():
+"""
+Processa o reconhecimento em uma thread separada.
+
+```
+A câmera permanece livre para continuar capturando
+e exibindo frames.
+"""
+
+global resultado_reconhecimento
+
+while executando:
+
+    try:
+
+        item = fila_reconhecimento.get(
+            timeout=0.2
+        )
+
+    except Empty:
+
+        continue
+
+    if item is None:
+
+        fila_reconhecimento.task_done()
+
+        break
+
+    frame = item["frame"]
+
+    locais = item["localizacoes"]
+
+    try:
+
+        print()
+        print(
+            "[RECONHECIMENTO] "
+            "Executando reconhecimento..."
+        )
+
+        caminho = salvar_frame(
+            frame
+        )
+
+        resultado = (
+            reconhecer_e_registrar_ocorrencia(
+                imagem_path=str(caminho),
+                camera_id=CAMERA_ID,
+                tolerancia=0.60,
+            )
+        )
+
+        matched_boxes = []
+
+        if resultado is None:
+
+            print(
+                "[RECONHECIMENTO] "
+                "Nenhum participante reconhecido."
+            )
+
+        else:
+
+            nome = resultado.get(
+                "name",
+                "Desconhecido",
+            )
+
+            similaridade = resultado.get(
+                "similarity"
+            )
+
+            occurrence_id = resultado.get(
+                "occurrence_id"
+            )
+
+            print(
+                "[RECONHECIMENTO] "
+                f"Pessoa: {nome}"
+            )
+
+            if similaridade is not None:
+
+                print(
+                    "[RECONHECIMENTO] "
+                    f"Similaridade: "
+                    f"{float(similaridade):.2f}%"
+                )
+
+            print(
+                "[RECONHECIMENTO] "
+                f"Occurrence ID: "
+                f"{occurrence_id}"
+            )
+
+            # Se existe apenas um rosto no frame,
+            # associamos diretamente a caixa.
+            if len(locais) == 1:
+
+                matched_boxes = [
+                    locais[0]
+                ]
+
+            elif locais:
+
+                # Para múltiplos rostos, selecionamos
+                # a maior região facial como referência
+                # visual do resultado retornado.
+                maior_area = 0
+                melhor_box = None
+
+                for box in locais:
+
+                    top, right, bottom, left = box
+
+                    largura = max(
+                        0,
+                        right - left,
+                    )
+
+                    altura = max(
+                        0,
+                        bottom - top,
+                    )
+
+                    area = (
+                        largura * altura
+                    )
+
+                    if area > maior_area:
+
+                        maior_area = area
+                        melhor_box = box
+
+                if melhor_box is not None:
+
+                    matched_boxes = [
+                        melhor_box
+                    ]
+
+        with lock_resultado:
+
+            resultado_reconhecimento = {
+                "boxes": list(locais),
+                "matched_boxes": list(
+                    matched_boxes
+                ),
+            }
+
+    except Exception as erro:
+
+        print()
+        print(
+            "[RECONHECIMENTO] "
+            f"ERRO: {erro}"
+        )
+
+        with lock_resultado:
+
+            resultado_reconhecimento = {
+                "boxes": list(locais),
+                "matched_boxes": [],
+            }
+
+    finally:
+
+        fila_reconhecimento.task_done()
+```
+
+# ============================================================
+
+# THREAD DE DETECÇÃO
+
+# ============================================================
+
+def trabalhador_deteccao():
+"""
+Thread responsável pela detecção facial.
+
+```
+Sempre utiliza o frame mais recente.
+"""
+
+global frame_para_processar
+global localizacoes_rosto
+
+while executando:
+
+    inicio = time.time()
+
+    with lock_frame:
+
+        if frame_para_processar is None:
+
+            frame = None
+
+        else:
+
+            frame = (
+                frame_para_processar.copy()
+            )
+
+    if frame is not None:
+
+        try:
+
+            locais = detectar_rostos(
+                frame
+            )
+
+            with lock_resultado:
+
+                localizacoes_rosto = locais
+
+        except Exception as erro:
+
+            print(
+                "[DETECÇÃO] "
+                f"Erro: {erro}"
+            )
+
+            with lock_resultado:
+
+                localizacoes_rosto = []
+
+    tempo_processamento = (
+        time.time() - inicio
+    )
+
+    espera = max(
+        0.0,
+        INTERVALO_DETECCAO
+        - tempo_processamento,
+    )
+
+    time.sleep(espera)
+```
+
+# ============================================================
+
+# DESENHO DAS DETECÇÕES
+
+# ============================================================
+
+def desenhar_deteccoes(
+frame,
+locais,
+matched_boxes,
+):
+"""
+Desenha as caixas dos rostos.
+
+```
+Verde:
+    rosto detectado.
+
+Vermelho:
+    rosto que teve reconhecimento positivo.
+"""
+
+for box in locais:
+
+    top, right, bottom, left = box
+
+    if box in matched_boxes:
+
+        cor = (
+            0,
+            0,
+            255,
+        )
+
+        texto = "Reconhecido"
+
+    else:
+
+        cor = (
+            0,
+            255,
+            0,
+        )
+
+        texto = "Rosto detectado"
+
+    cv2.rectangle(
+        frame,
+        (left, top),
+        (right, bottom),
+        cor,
+        2,
+    )
+
+    texto_y = top - 10
+
+    if texto_y < 20:
+
+        texto_y = bottom + 25
+
+    cv2.putText(
+        frame,
+        texto,
+        (left, texto_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        cor,
+        2,
+        cv2.LINE_AA,
+    )
+```
+
+# ============================================================
+
+# STATUS DA CÂMERA
+
+# ============================================================
+
+def desenhar_status(
+frame,
+fps,
+):
+"""
+Mostra informações do monitoramento.
+"""
+
+```
+texto = (
+    f"X-Face | Camera {CAMERA_ID} | "
+    f"FPS: {fps:.1f}"
+)
+
+cv2.putText(
+    frame,
+    texto,
+    (15, 30),
+    cv2.FONT_HERSHEY_SIMPLEX,
+    0.65,
+    (255, 255, 255),
+    2,
+    cv2.LINE_AA,
+)
+```
+
+# ============================================================
+
+# EXECUÇÃO PRINCIPAL
+
+# ============================================================
+
+def executar_camera():
+
+```
+global frame_para_processar
+global localizacoes_rosto
+global resultado_reconhecimento
+global executando
+global ultimo_registro
+
+camera = abrir_camera()
+
+executando = True
+ultimo_registro = 0.0
+
+with lock_frame:
+
+    frame_para_processar = None
+
+with lock_resultado:
+
+    localizacoes_rosto = []
+
+    resultado_reconhecimento = {
+        "boxes": [],
+        "matched_boxes": [],
+    }
+
+# --------------------------------------------------------
+# Thread de detecção
+# --------------------------------------------------------
+
+thread_deteccao = threading.Thread(
+    target=trabalhador_deteccao,
+    daemon=True,
+    name="XFace-Deteccao",
+)
+
+# --------------------------------------------------------
+# Thread de reconhecimento
+# --------------------------------------------------------
+
+thread_reconhecimento = threading.Thread(
+    target=trabalhador_reconhecimento,
+    daemon=True,
+    name="XFace-Reconhecimento",
+)
+
+thread_deteccao.start()
+thread_reconhecimento.start()
+
+print()
+print("========================================")
+print("X-FACE - MONITORAMENTO DA CÂMERA")
+print("========================================")
+print(f"Câmera: {CAMERA_ID}")
+print("Detecção facial: HOG")
+print("Escala de detecção: 50%")
+print("Reconhecimento: thread separada")
+print(
+    f"Intervalo de ocorrência: "
+    f"{INTERVALO_OCORRENCIA:.1f}s"
+)
+print("Pressione Q ou ESC para sair.")
+print()
+
+contador_frames = 0
+inicio_fps = time.time()
+fps = 0.0
+
+try:
+
+    while True:
+
+        sucesso, frame = camera.read()
+
+        if not sucesso:
+
+            print(
+                "Erro ao capturar "
+                "frame da câmera."
+            )
+
+            break
+
+        # ------------------------------------------------
+        # Atualiza somente o frame mais recente.
+        # ------------------------------------------------
+
+        with lock_frame:
+
+            frame_para_processar = (
+                frame.copy()
+            )
+
+        # ------------------------------------------------
+        # Obtém o resultado mais recente.
+        # ------------------------------------------------
+
+        with lock_resultado:
+
+            locais = list(
+                localizacoes_rosto
+            )
+
+            matched_boxes = list(
+                resultado_reconhecimento[
+                    "matched_boxes"
+                ]
+            )
+
+        # ------------------------------------------------
+        # Agenda reconhecimento sem bloquear a câmera.
+        # ------------------------------------------------
+
+        if locais:
+
+            tentar_agendar_reconhecimento(
+                frame,
+                locais,
+            )
+
+        # ------------------------------------------------
+        # Frame utilizado somente para exibição.
+        # ------------------------------------------------
+
+        frame_exibicao = frame.copy()
+
+        desenhar_deteccoes(
+            frame_exibicao,
+            locais,
+            matched_boxes,
+        )
+
+        # ------------------------------------------------
+        # Cálculo do FPS.
+        # ------------------------------------------------
+
+        contador_frames += 1
+
+        agora = time.time()
+
+        intervalo_fps = (
+            agora - inicio_fps
+        )
+
+        if intervalo_fps >= 1.0:
+
+            fps = (
+                contador_frames
+                / intervalo_fps
+            )
+
+            contador_frames = 0
+            inicio_fps = agora
+
+        desenhar_status(
+            frame_exibicao,
+            fps,
+        )
+
+        # ------------------------------------------------
+        # Exibe a câmera.
+        # ------------------------------------------------
+
+        cv2.imshow(
+            "X-Face - Camera",
+            frame_exibicao,
+        )
+
+        tecla = (
+            cv2.waitKey(1)
+            & 0xFF
+        )
+
+        if tecla in (
+            ord("q"),
+            27,
+        ):
+
+            break
+
+finally:
+
+    executando = False
+
+    with lock_frame:
+
+        frame_para_processar = None
+
+    # ----------------------------------------------------
+    # Libera a thread de reconhecimento.
+    # ----------------------------------------------------
+
+    try:
+
+        fila_reconhecimento.put_nowait(
+            None
+        )
+
+    except Full:
+
+        pass
+
+    camera.release()
+
+    cv2.destroyAllWindows()
+
+    print()
+    print(
+        "Câmera encerrada."
+    )
+```
+
+# ============================================================
+
+# ENTRADA DO PROGRAMA
+
+# ============================================================
+
+if **name** == "**main**":
+executar_camera()

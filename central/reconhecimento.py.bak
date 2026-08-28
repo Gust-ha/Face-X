@@ -1,0 +1,239 @@
+import json
+from pathlib import Path
+
+import face_recognition
+import numpy as np
+from sqlalchemy import text
+
+from database.connection import engine
+
+
+TOLERANCIA_PADRAO = 0.60
+
+
+def carregar_participantes():
+    """
+    Carrega do PostgreSQL todos os participantes que possuem
+    um encoding facial cadastrado.
+    """
+
+    query = text("""
+        SELECT
+            id,
+            name,
+            age,
+            status,
+            crime,
+            face_reference,
+            face_encoding
+        FROM participants
+        WHERE face_encoding IS NOT NULL
+          AND face_encoding <> ''
+        ORDER BY id
+    """)
+
+    with engine.connect() as connection:
+        rows = connection.execute(query).mappings().all()
+
+    participantes = []
+
+    for row in rows:
+        try:
+            encoding = np.array(
+                json.loads(row["face_encoding"]),
+                dtype=np.float64
+            )
+        except (json.JSONDecodeError, TypeError) as erro:
+            print(
+                f"AVISO: encoding inválido para "
+                f"participant_id={row['id']}: {erro}"
+            )
+            continue
+
+        if encoding.shape != (128,):
+            print(
+                f"AVISO: encoding inválido para "
+                f"participant_id={row['id']}: "
+                f"{encoding.shape}"
+            )
+            continue
+
+        participantes.append({
+            "id": row["id"],
+            "name": row["name"],
+            "age": row["age"],
+            "status": row["status"],
+            "crime": row["crime"],
+            "face_reference": row["face_reference"],
+            "encoding": encoding,
+        })
+
+    return participantes
+
+
+def gerar_encoding(imagem_path):
+    """
+    Detecta exatamente um rosto em uma imagem e gera
+    seu encoding facial de 128 dimensões.
+    """
+
+    imagem_path = Path(imagem_path)
+
+    if not imagem_path.exists():
+        raise FileNotFoundError(
+            f"Imagem não encontrada: {imagem_path}"
+        )
+
+    imagem = face_recognition.load_image_file(
+        str(imagem_path)
+    )
+
+    localizacoes = face_recognition.face_locations(
+        imagem,
+        model="cnn"
+    )
+
+    if len(localizacoes) == 0:
+        raise RuntimeError(
+            "Nenhum rosto foi encontrado na imagem."
+        )
+
+    if len(localizacoes) > 1:
+        raise RuntimeError(
+            f"Foram encontrados {len(localizacoes)} rostos. "
+            "A identificação exige exatamente um rosto."
+        )
+
+    encodings = face_recognition.face_encodings(
+        imagem,
+        known_face_locations=localizacoes
+    )
+
+    if len(encodings) != 1:
+        raise RuntimeError(
+            "Não foi possível gerar o encoding facial."
+        )
+
+    encoding = encodings[0]
+
+    if len(encoding) != 128:
+        raise RuntimeError(
+            f"Encoding inesperado: {len(encoding)} dimensões."
+        )
+
+    return encoding
+
+
+def reconhecer_encoding(
+    encoding,
+    participantes=None,
+    tolerancia=TOLERANCIA_PADRAO
+):
+    """
+    Compara um encoding contra todos os participantes.
+
+    Retorna o participante com menor distância caso esteja
+    dentro da tolerância.
+
+    Retorno:
+
+        {
+            "id": ...,
+            "name": ...,
+            "age": ...,
+            "status": ...,
+            "crime": ...,
+            "face_reference": ...,
+            "distance": ...,
+            "similarity": ...,
+            "matched": True
+        }
+
+    Caso ninguém corresponda, retorna None.
+    """
+
+    if participantes is None:
+        participantes = carregar_participantes()
+
+    if not participantes:
+        return None
+
+    encoding = np.asarray(
+        encoding,
+        dtype=np.float64
+    )
+
+    if encoding.shape != (128,):
+        raise ValueError(
+            f"Encoding recebido possui formato inválido: "
+            f"{encoding.shape}"
+        )
+
+    encodings_conhecidos = [
+        participante["encoding"]
+        for participante in participantes
+    ]
+
+    distancias = face_recognition.face_distance(
+        encodings_conhecidos,
+        encoding
+    )
+
+    melhor_indice = int(np.argmin(distancias))
+    menor_distancia = float(distancias[melhor_indice])
+
+    melhor_participante = participantes[melhor_indice]
+
+    # A distância facial não é uma porcentagem.
+    # Para a interface, convertemos para uma escala simples
+    # de similaridade aproximada.
+    similarity = max(
+        0.0,
+        (1.0 - menor_distancia) * 100.0
+    )
+
+    resultado = {
+        "id": melhor_participante["id"],
+        "name": melhor_participante["name"],
+        "age": melhor_participante["age"],
+        "status": melhor_participante["status"],
+        "crime": melhor_participante["crime"],
+        "face_reference": melhor_participante["face_reference"],
+        "distance": menor_distancia,
+        "similarity": similarity,
+        "matched": menor_distancia <= tolerancia,
+    }
+
+    if not resultado["matched"]:
+        return None
+
+    return resultado
+
+
+def reconhecer_imagem(
+    imagem_path,
+    tolerancia=TOLERANCIA_PADRAO
+):
+    """
+    Função de alto nível:
+
+        imagem
+          ↓
+        encoding
+          ↓
+        PostgreSQL
+          ↓
+        comparação
+          ↓
+        melhor participante
+    """
+
+    encoding = gerar_encoding(imagem_path)
+
+    participantes = carregar_participantes()
+
+    return reconhecer_encoding(
+        encoding,
+        participantes=participantes,
+        tolerancia=tolerancia
+    )

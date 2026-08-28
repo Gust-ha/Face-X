@@ -1,0 +1,115 @@
+from sqlalchemy import text
+from database.connection import engine
+
+
+def buscar_ocorrencias_pendentes():
+    query = text("""
+        SELECT
+            o.id AS occurrence_id,
+            p.name,
+            p.age,
+            p.status,
+            p.crime,
+            c.name AS camera,
+            c.location,
+            o.similarity,
+            o.detected_at,
+            o.status AS occurrence_status,
+            o.frame_path
+        FROM occurrences o
+        JOIN participants p
+            ON o.participant_id = p.id
+        JOIN cameras c
+            ON o.camera_id = c.id
+        WHERE o.status = 'PENDING'
+        ORDER BY o.detected_at ASC
+    """)
+
+    with engine.connect() as connection:
+        result = connection.execute(query)
+
+        return result.mappings().all()
+
+
+def registrar_ocorrencia(
+    participant_id,
+    camera_id,
+    similarity,
+    frame_path
+):
+    query = text("""
+        INSERT INTO occurrences (
+            participant_id,
+            camera_id,
+            similarity,
+            status,
+            frame_path
+        )
+        VALUES (
+            :participant_id,
+            :camera_id,
+            :similarity,
+            'PENDING',
+            :frame_path
+        )
+        RETURNING id
+    """)
+
+    with engine.begin() as connection:
+        result = connection.execute(
+            query,
+            {
+                "participant_id": participant_id,
+                "camera_id": camera_id,
+                "similarity": similarity,
+                "frame_path": frame_path
+            }
+        )
+
+        return result.scalar()
+
+from central.reconhecimento import reconhecer_imagem
+
+
+def reconhecer_e_registrar_ocorrencia(
+    imagem_path,
+    camera_id,
+    tolerancia=0.60
+):
+    """
+    Reconhece uma pessoa em uma imagem e, caso exista
+    correspondência na base, registra uma ocorrência PENDING.
+
+    Retorna um dicionário com o resultado do reconhecimento
+    e o ID da ocorrência criada.
+    """
+
+    resultado = reconhecer_imagem(
+        imagem_path,
+        tolerancia=tolerancia
+    )
+
+    # Nenhuma pessoa correspondente encontrada.
+    if resultado is None:
+        return None
+
+    # O campo similarity é uma métrica de apresentação.
+    # Armazenamos essa métrica na coluna occurrences.similarity.
+    occurrence_id = registrar_ocorrencia(
+        participant_id=resultado["id"],
+        camera_id=camera_id,
+        similarity=resultado["similarity"],
+        frame_path=str(imagem_path)
+    )
+
+    return {
+        "occurrence_id": occurrence_id,
+        "participant_id": resultado["id"],
+        "name": resultado["name"],
+        "age": resultado["age"],
+        "status": resultado["status"],
+        "crime": resultado["crime"],
+        "distance": resultado["distance"],
+        "similarity": resultado["similarity"],
+        "frame_path": str(imagem_path),
+    }
